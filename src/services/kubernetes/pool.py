@@ -6,6 +6,7 @@ pool with configurable size.
 """
 
 import asyncio
+import os
 from collections import defaultdict
 from datetime import UTC, datetime, timedelta, timezone
 from typing import Dict, List, Optional, Set
@@ -16,9 +17,11 @@ import structlog
 from kubernetes.client import ApiException
 
 from .client import (
+    build_custom_labels,
     create_pod_manifest,
     get_core_api,
     get_current_namespace,
+    get_initialization_error,
 )
 from .models import (
     ExecutionResult,
@@ -67,6 +70,11 @@ class PodPool:
         # HTTP client for health checks and execution
         self._http_client: httpx.AsyncClient | None = None
 
+        # UID of the API pod running this pool manager, stamped onto every
+        # pool pod we create so cleanup can distinguish our orphans from live
+        # pods owned by other replicas. Set during start().
+        self._owner_pod_uid: str | None = None
+
         # Background tasks
         self._replenish_task: asyncio.Task | None = None
         self._health_check_task: asyncio.Task | None = None
@@ -97,6 +105,15 @@ class PodPool:
             language=self.language,
             pool_size=self.pool_size,
         )
+
+        # Resolve our own pod UID so we can stamp ownership on pool pods and
+        # safely distinguish our orphans from live pods of other replicas.
+        self._owner_pod_uid = await self._resolve_owner_pod_uid()
+
+        # Delete pods left behind by crashed/evicted previous instances.
+        # Ownership-aware: only deletes pods whose owner pod no longer exists,
+        # so live pods from other running replicas are never touched.
+        await self._cleanup_orphaned_pods()
 
         # Initial warmup
         await self._warmup()
@@ -136,6 +153,140 @@ class PodPool:
 
         logger.info("Pod pool stopped", language=self.language)
 
+    async def _resolve_owner_pod_uid(self) -> str | None:
+        """Return this API pod's UID by looking up HOSTNAME in the k8s API.
+
+        Returns None when running outside a cluster or when the lookup fails;
+        in that case orphan cleanup is skipped to avoid false positives.
+        """
+        pod_name = os.environ.get("HOSTNAME")
+        if not pod_name:
+            return None
+
+        core_api = get_core_api()
+        if not core_api:
+            return None
+
+        try:
+            loop = asyncio.get_event_loop()
+            pod = await loop.run_in_executor(
+                None,
+                lambda: core_api.read_namespaced_pod(pod_name, self.namespace),
+            )
+            return pod.metadata.uid
+        except Exception:
+            # Best-effort: any failure (API error, missing attribute, thread
+            # pool issue) should not prevent the pool from starting.
+            logger.debug(
+                "Could not resolve owner pod UID; orphan cleanup will be skipped",
+                language=self.language,
+            )
+            return None
+
+    async def _cleanup_orphaned_pods(self):
+        """Delete pool pods left behind by crashed or evicted API pods.
+
+        On ungraceful shutdown (OOM, SIGKILL, node eviction) stop() is never
+        called, so warm pods are orphaned in Kubernetes. Because Pods have no
+        TTL, they accumulate across restarts and exhaust namespace CPU quota.
+
+        Ownership-aware: each pool pod carries a
+        ``kubecoderun.io/owner-pod-uid`` label set to the UID of the API pod
+        that created it. Cleanup checks every distinct owner UID found on
+        existing pool pods; if that owner pod no longer exists the pool pods
+        are deleted. Pods owned by other live replicas are left untouched, so
+        rolling updates and multi-replica deployments are safe.
+
+        Skipped entirely when we cannot resolve our own pod UID (e.g. running
+        outside a cluster during local development).
+        """
+        if not self._owner_pod_uid:
+            logger.debug(
+                "Skipping orphan cleanup (owner pod UID unavailable)",
+                language=self.language,
+            )
+            return
+
+        core_api = get_core_api()
+        if not core_api:
+            return
+
+        label_selector = (
+            f"app.kubernetes.io/managed-by=kubecoderun,kubecoderun.io/type=pool,kubecoderun.io/language={self.language}"
+        )
+
+        try:
+            loop = asyncio.get_event_loop()
+            pod_list = await loop.run_in_executor(
+                None,
+                lambda: core_api.list_namespaced_pod(
+                    self.namespace,
+                    label_selector=label_selector,
+                ),
+            )
+
+            if not pod_list.items:
+                return
+
+            # Group existing pool pods by their owner UID.
+            by_owner: dict[str | None, list] = defaultdict(list)
+            for pod in pod_list.items:
+                owner = (pod.metadata.labels or {}).get("kubecoderun.io/owner-pod-uid")
+                by_owner[owner].append(pod)
+
+            # Build the set of live pod UIDs in this namespace with one call.
+            # Cheaper than one read_namespaced_pod call per distinct owner and
+            # avoids the name-vs-UID confusion (read_namespaced_pod takes a name).
+            all_pods = await loop.run_in_executor(
+                None,
+                lambda: core_api.list_namespaced_pod(self.namespace),
+            )
+            live_uids = {pod.metadata.uid for pod in all_pods.items}
+
+            for owner_uid, pods in by_owner.items():
+                # Never touch pods owned by this instance.
+                if owner_uid == self._owner_pod_uid:
+                    continue
+
+                # Pods without an owner label pre-date this feature (created by
+                # an older API version during a rolling upgrade). Leave them
+                # alone to avoid disrupting still-live old replicas.
+                if owner_uid is None:
+                    continue
+
+                # If the owner pod is still alive, leave its pool pods alone
+                # (handles rolling updates and multi-replica deployments).
+                if owner_uid in live_uids:
+                    continue
+
+                logger.info(
+                    "Cleaning up orphaned pool pods",
+                    language=self.language,
+                    owner_pod_uid=owner_uid,
+                    count=len(pods),
+                )
+                for pod in pods:
+                    await self._delete_pod(
+                        PodHandle(
+                            name=pod.metadata.name,
+                            namespace=self.namespace,
+                            uid=pod.metadata.uid,
+                            language=self.language,
+                            status=PodStatus.WARM,
+                            labels=pod.metadata.labels or {},
+                        )
+                    )
+
+        except asyncio.CancelledError:
+            raise
+        except Exception as e:
+            # Best-effort: cleanup failures must not abort pool startup.
+            logger.warning(
+                "Failed to clean up orphaned pool pods",
+                language=self.language,
+                error=str(e),
+            )
+
     async def _warmup(self):
         """Create initial warm pods."""
         current_count = len([p for p in self._pods.values() if p.is_available])
@@ -155,12 +306,25 @@ class PodPool:
         batch_size = min(needed, 5)
         for i in range(0, needed, batch_size):
             tasks = [self._create_warm_pod() for _ in range(min(batch_size, needed - i))]
-            await asyncio.gather(*tasks, return_exceptions=True)
+            results = await asyncio.gather(*tasks, return_exceptions=True)
+            for result in results:
+                if isinstance(result, BaseException):
+                    logger.error(
+                        "Unexpected error during pool warmup",
+                        language=self.language,
+                        error=str(result),
+                        exc_info=(type(result), result, result.__traceback__),
+                    )
 
     async def _create_warm_pod(self) -> PooledPod | None:
         """Create a single warm pod."""
         core_api = get_core_api()
         if not core_api:
+            logger.error(
+                "Cannot create warm pod: Kubernetes client unavailable",
+                language=self.language,
+                init_error=get_initialization_error(),
+            )
             return None
 
         pod_name = self._generate_pod_name()
@@ -172,27 +336,34 @@ class PodPool:
             "kubecoderun.io/language": self.language,
             "kubecoderun.io/type": "pool",
             "kubecoderun.io/pool-status": "warm",
+            **build_custom_labels(
+                self.config.pod_labels,
+                self.config.pod_label_language_suffix,
+                self.language,
+            ),
         }
-
-        pod_manifest = create_pod_manifest(
-            name=pod_name,
-            namespace=self.namespace,
-            main_image=self.config.image,
-            language=self.language,
-            labels=labels,
-            cpu_limit=self.config.cpu_limit or "1",
-            memory_limit=self.config.memory_limit or "512Mi",
-            image_pull_policy=self.config.image_pull_policy,
-            runner_port=8080,
-            seccomp_profile_type=self.config.seccomp_profile_type,
-            network_isolated=self.config.network_isolated,
-            runtime_class_name=self.config.runtime_class_name,
-            pod_node_selector=self.config.pod_node_selector,
-            pod_tolerations=self.config.pod_tolerations,
-            image_pull_secrets=self.config.image_pull_secrets,
-        )
+        if self._owner_pod_uid:
+            labels["kubecoderun.io/owner-pod-uid"] = self._owner_pod_uid
 
         try:
+            pod_manifest = create_pod_manifest(
+                name=pod_name,
+                namespace=self.namespace,
+                main_image=self.config.image,
+                language=self.language,
+                labels=labels,
+                cpu_limit=self.config.cpu_limit or "1",
+                memory_limit=self.config.memory_limit or "512Mi",
+                image_pull_policy=self.config.image_pull_policy,
+                runner_port=8080,
+                seccomp_profile_type=self.config.seccomp_profile_type,
+                network_isolated=self.config.network_isolated,
+                runtime_class_name=self.config.runtime_class_name,
+                pod_node_selector=self.config.pod_node_selector,
+                pod_tolerations=self.config.pod_tolerations,
+                image_pull_secrets=self.config.image_pull_secrets,
+            )
+
             loop = asyncio.get_event_loop()
             pod = await loop.run_in_executor(
                 None,
@@ -211,6 +382,11 @@ class PodPool:
             # Wait for pod to be ready
             ready = await self._wait_for_pod_ready(handle)
             if not ready:
+                logger.warning(
+                    "Warm pod did not become ready, deleting",
+                    pod_name=pod_name,
+                    language=self.language,
+                )
                 await self._delete_pod(handle)
                 return None
 
@@ -235,9 +411,21 @@ class PodPool:
 
         except ApiException as e:
             logger.error(
-                "Failed to create warm pod",
+                "Failed to create warm pod (Kubernetes API error)",
                 pod_name=pod_name,
+                language=self.language,
+                status=e.status,
+                reason=e.reason,
                 error=str(e),
+            )
+            return None
+        except Exception as e:
+            logger.error(
+                "Failed to create warm pod (unexpected error)",
+                pod_name=pod_name,
+                language=self.language,
+                error=str(e),
+                exc_info=True,
             )
             return None
 
@@ -342,7 +530,15 @@ class PodPool:
                     for i in range(0, needed, 5):
                         batch = min(5, needed - i)
                         tasks = [self._create_warm_pod() for _ in range(batch)]
-                        await asyncio.gather(*tasks, return_exceptions=True)
+                        results = await asyncio.gather(*tasks, return_exceptions=True)
+                        for result in results:
+                            if isinstance(result, BaseException):
+                                logger.error(
+                                    "Unexpected error during pool replenishment",
+                                    language=self.language,
+                                    error=str(result),
+                                    exc_info=(type(result), result, result.__traceback__),
+                                )
 
             except asyncio.CancelledError:
                 break
@@ -535,20 +731,56 @@ class PodPool:
         client = await self._get_http_client()
         runner_url = handle.runner_url
 
-        # Upload files if provided
+        # Upload files if provided. Large files (observed in issue #57 for
+        # datasets >16 MB) can exceed a fixed 30s window; scale the timeout
+        # with payload size and fail fast with a clear error so callers know
+        # the execution environment is missing expected files.
         if files:
             for file_data in files:
+                upload_timeout = max(30, len(file_data.content) // (1024 * 1024) + 30)
                 try:
-                    await client.post(
+                    response = await client.post(
                         f"{runner_url}/files",
                         files={"files": (file_data.filename, file_data.content)},
-                        timeout=30,
+                        timeout=upload_timeout,
+                    )
+                    if response.status_code >= 400:
+                        return ExecutionResult(
+                            exit_code=1,
+                            stdout="",
+                            stderr=(
+                                f"Failed to upload '{file_data.filename}' to execution pod "
+                                f"(runner returned {response.status_code}). The pod may have "
+                                "been restarted mid-request."
+                            ),
+                            execution_time_ms=0,
+                        )
+                except httpx.TimeoutException:
+                    return ExecutionResult(
+                        exit_code=1,
+                        stdout="",
+                        stderr=(
+                            f"Timed out uploading '{file_data.filename}' ({len(file_data.content)} bytes) "
+                            f"to execution pod after {upload_timeout}s. Consider reducing file size "
+                            "or raising max_file_size_mb."
+                        ),
+                        execution_time_ms=0,
                     )
                 except Exception as e:
-                    logger.warning(
-                        "Failed to upload file",
+                    logger.error(
+                        "Failed to upload file to pod",
+                        pod_name=handle.name,
                         filename=file_data.filename,
                         error=str(e),
+                    )
+                    return ExecutionResult(
+                        exit_code=1,
+                        stdout="",
+                        stderr=(
+                            f"Failed to upload '{file_data.filename}' to execution pod: {e}. "
+                            "The pod may have been restarted (OOM or timeout)."
+                        ),
+                        execution_time_ms=0,
                     )
 
         # Execute code
@@ -600,12 +832,58 @@ class PodPool:
                 pod_name=handle.name,
                 error=str(e),
             )
+            # Inspect the pod so the caller learns *why* the connection dropped
+            # (issue #57: "socket hang up" typically means the pod was
+            # OOMKilled or evicted mid-request).
+            pod_failure_reason = await self._inspect_pod_failure(handle)
+            stderr = f"Execution error: {str(e)}"
+            if pod_failure_reason:
+                stderr = f"{stderr}. Pod status: {pod_failure_reason}"
             return ExecutionResult(
                 exit_code=1,
                 stdout="",
-                stderr=f"Execution error: {str(e)}",
+                stderr=stderr,
                 execution_time_ms=0,
             )
+
+    async def _inspect_pod_failure(self, handle: PodHandle) -> str | None:
+        """Best-effort lookup of why a pod stopped responding.
+
+        Returns a short human-readable reason (e.g. "OOMKilled", "Evicted")
+        or None if the pod still appears healthy or the K8s API is
+        unavailable. Used to turn opaque "socket hang up" errors into
+        actionable messages.
+        """
+        core_api = get_core_api()
+        if not core_api:
+            return None
+
+        try:
+            loop = asyncio.get_event_loop()
+            pod = await loop.run_in_executor(
+                None,
+                lambda: core_api.read_namespaced_pod(handle.name, handle.namespace),
+            )
+        except ApiException as e:
+            if e.status == 404:
+                return "pod not found (deleted or restarted)"
+            return None
+        except Exception:
+            return None
+
+        phase = getattr(pod.status, "phase", None)
+        reason = getattr(pod.status, "reason", None)
+        if reason:
+            return reason
+        if pod.status and pod.status.container_statuses:
+            for cs in pod.status.container_statuses:
+                terminated = getattr(getattr(cs, "last_state", None), "terminated", None)
+                if terminated and terminated.reason:
+                    return terminated.reason
+                waiting = getattr(getattr(cs, "state", None), "waiting", None)
+                if waiting and waiting.reason:
+                    return waiting.reason
+        return phase
 
     @property
     def available_count(self) -> int:
