@@ -90,6 +90,69 @@ class Settings(BaseSettings):
         default="",
         description="Comma-separated CIDRs that bypass API key auth (e.g. '10.0.0.0/8,172.16.0.0/12')",
     )
+    auth_enabled: bool = Field(
+        default=True,
+        description=(
+            "Require an API key (header or Basic auth) on user endpoints. "
+            "Set false when running behind a trusted network boundary where "
+            "another layer (mTLS, VPC, sidecar) already authenticates callers. "
+            "Admin endpoints (/api/v1/admin) ALWAYS require MASTER_API_KEY "
+            "regardless of this setting."
+        ),
+    )
+
+    # CodeAPI JWT — LibreChat 0.8.5 (danny-avila/LibreChat#13028) mints
+    # short-lived signed JWTs and sends them as `Authorization: Bearer <jwt>`.
+    # When this verifier is enabled we accept those tokens in addition to the
+    # legacy API-key / Basic-auth paths. Env-var names mirror LC's signer side
+    # (CODEAPI_JWT_*) so operator docs are 1:1.
+    codeapi_jwt_enabled: bool = Field(
+        default=False,
+        description=(
+            "Accept LibreChat-minted CodeAPI JWTs in Authorization: Bearer. "
+            "Required when LibreChat is configured with "
+            "CODEAPI_AUTH_PROVIDER=librechat-jwt|both. Off by default so legacy "
+            "API-key clients continue to work unchanged."
+        ),
+    )
+    codeapi_jwt_public_key: str | None = Field(
+        default=None,
+        description=(
+            "Public key for verifying CodeAPI JWTs. Accepts PEM (begins with "
+            "'-----BEGIN PUBLIC KEY-----'), raw JWK JSON ('{\"kty\":...}'), or "
+            "an absolute file path. Pairs with LibreChat's "
+            "CODEAPI_JWT_PRIVATE_KEY / CODEAPI_JWT_PRIVATE_JWK_JSON."
+        ),
+    )
+    codeapi_jwt_algorithm: Literal["EdDSA", "RS256"] = Field(
+        default="EdDSA",
+        description="JWT signing algorithm. Must match LC's CODEAPI_JWT_ALGORITHM.",
+    )
+    codeapi_jwt_issuer: str = Field(
+        default="librechat",
+        description="Expected `iss` claim. Must match LC's CODEAPI_JWT_ISSUER.",
+    )
+    codeapi_jwt_audience: str = Field(
+        default="codeapi",
+        description="Expected `aud` claim. Must match LC's CODEAPI_JWT_AUDIENCE.",
+    )
+    codeapi_jwt_leeway_seconds: int = Field(
+        default=10,
+        ge=0,
+        le=60,
+        description=(
+            "Clock-skew tolerance for exp/nbf validation. LC mints tokens "
+            "with nbf=iat and a 300s TTL by default, so small skew is normal."
+        ),
+    )
+    codeapi_jwt_trust_tenant_id: bool = Field(
+        default=False,
+        description=(
+            "When true, the JWT's `tenant_id` claim is recorded on new "
+            "sessions (metadata.tenant_id). KubeCodeRun does not enforce "
+            "tenant-scoped ACLs today; this is observability-only."
+        ),
+    )
 
     # Redis Configuration
     redis_host: str = Field(default="localhost")
@@ -253,6 +316,7 @@ class Settings(BaseSettings):
     pod_pool_r: int = Field(default=0, ge=0, le=50, description="R pool size")
     pod_pool_f90: int = Field(default=0, ge=0, le=50, description="Fortran pool size")
     pod_pool_d: int = Field(default=0, ge=0, le=50, description="D pool size")
+    pod_pool_bash: int = Field(default=0, ge=0, le=50, description="Bash pool size")
 
     # Pool Optimization Configuration
     pod_pool_parallel_batch: int = Field(
@@ -630,7 +694,7 @@ class Settings(BaseSettings):
         from ..services.kubernetes.models import PoolConfig
 
         configs = []
-        languages = ["py", "js", "ts", "go", "java", "c", "cpp", "php", "rs", "r", "f90", "d"]
+        languages = ["py", "js", "ts", "go", "java", "c", "cpp", "php", "rs", "r", "f90", "d", "bash"]
 
         pool_sizes = {
             "py": self.pod_pool_py,
@@ -645,6 +709,7 @@ class Settings(BaseSettings):
             "r": self.pod_pool_r,
             "f90": self.pod_pool_f90,
             "d": self.pod_pool_d,
+            "bash": self.pod_pool_bash,
         }
 
         for lang in languages:
