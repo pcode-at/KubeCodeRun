@@ -20,7 +20,7 @@
 #   DHI_PASSWORD         Password for dhi.io registry login
 #
 # Examples:
-#   ./scripts/build-images.sh                  # Build all images in parallel
+#   ./scripts/build-images.sh                  # Build all images in parallel (linux/amd64)
 #   ./scripts/build-images.sh go               # Build only the go image with full output
 #   ./scripts/build-images.sh --no-cache rust  # Build rust image without cache
 
@@ -34,6 +34,7 @@ DOCKER_DIR="$PROJECT_ROOT/docker"
 TAG="latest"
 PREFIX="kcr"  # Local image prefix to avoid conflicts with official images
 REGISTRY=""   # When set, overrides PREFIX (for pushing to registries)
+PLATFORM="linux/amd64"  # Target platform for builds
 PUSH=false
 NO_CACHE=""
 SEQUENTIAL=false
@@ -193,11 +194,12 @@ build_image() {
 
     # shellcheck disable=SC2086
     build_output=$(docker build \
-        --platform linux/amd64 \
+        --platform "$PLATFORM" \
         $NO_CACHE \
         --build-arg VERSION="$TAG" \
         --build-arg BUILD_DATE="$build_date" \
         --build-arg VCS_REF="$vcs_ref" \
+        --build-arg RUNNER_IMAGE="$(get_full_image_name runner)" \
         -t "$full_name" \
         -f "$DOCKER_DIR/$dockerfile" \
         "$context_path" 2>&1) || exit_code=$?
@@ -286,11 +288,12 @@ build_single_image() {
             vcs_ref=$(git -C "$PROJECT_ROOT" rev-parse --short HEAD 2>/dev/null || echo "unknown")
             # shellcheck disable=SC2086
             docker build \
-                --platform linux/amd64 \
+                --platform "$PLATFORM" \
                 $NO_CACHE \
                 --build-arg VERSION="$TAG" \
                 --build-arg BUILD_DATE="$build_date" \
                 --build-arg VCS_REF="$vcs_ref" \
+                --build-arg RUNNER_IMAGE="$(get_full_image_name runner)" \
                 -t "$full_name" \
                 -f "$DOCKER_DIR/$dockerfile" \
                 "$context_path"
@@ -341,6 +344,7 @@ main() {
     echo "║           KubeCodeRun Docker Image Builder               ║"
     echo "╠══════════════════════════════════════════════════════════╣"
     echo "║  Tag:      ${TAG}"
+    echo "║  Platform: ${PLATFORM}"
     if [[ -n "$REGISTRY" ]]; then
         echo "║  Registry: ${REGISTRY}"
     fi
