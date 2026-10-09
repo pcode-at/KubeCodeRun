@@ -49,6 +49,10 @@ async def upload_file(
     file: UploadFile | None = File(None),
     files: list[UploadFile] | None = File(None),
     entity_id: str | None = Form(None),
+    kind: str | None = Form(None),
+    id: str | None = Form(None),
+    version: str | None = Form(None),
+    read_only: str | None = Form(None),
     user_id_header: str | None = Header(None, alias="User-Id"),
     x_user_id_header: str | None = Header(None, alias="X-User-Id"),
     file_service: FileServiceDep = None,
@@ -58,6 +62,12 @@ async def upload_file(
 
     Accepts files in either 'file' (singular) or 'files' (plural) field names.
     LibreChat uses 'file' while our tests use 'files'.
+
+    Identity form fields (``kind`` / ``id`` / ``version`` / ``read_only``)
+    mirror ``/upload/batch`` so single-file uploads carry the same LibreChat
+    ``CodeEnvFile`` discriminator. ``kind`` / ``id`` land on session metadata
+    and ``read_only`` is persisted per file so skill/agent inputs are echoed
+    as inherited passthroughs rather than generated artifacts.
 
     user_id resolution (most-trustworthy first):
       1. JWT.sub via request.state.user_id (cryptographically authenticated
@@ -71,6 +81,7 @@ async def upload_file(
     """
     jwt_user_id = getattr(request.state, "user_id", None) if request else None
     request_user_id = jwt_user_id or user_id_header or x_user_id_header
+    read_only_flag = (read_only or "").strip().lower() == "true"
     try:
         # Handle both singular and plural field names
         upload_files = []
@@ -153,6 +164,10 @@ async def upload_file(
                 session_metadata["entity_id"] = entity_id
             if request_user_id:
                 session_metadata["user_id"] = request_user_id
+            if kind:
+                session_metadata["kind"] = kind
+            if id:
+                session_metadata["resource_id"] = id
             session = await session_service.create_session(SessionCreate(metadata=session_metadata))
             session_id = session.session_id
 
@@ -160,9 +175,12 @@ async def upload_file(
             # Read file content
             content = await file.read()
 
-            # Sanitize filename before storage so the name on disk in the
-            # execution pod matches what LibreChat reports to the model.
-            sanitized_name = OutputProcessor.sanitize_filename(file.filename)
+            # Sanitize the upload name before storage so the name on disk in
+            # the execution pod matches what LibreChat reports to the model.
+            # sanitize_filepath preserves safe nested directories (e.g.
+            # skill bundles uploaded as ``skillName/SKILL.md``) instead of
+            # flattening them to a basename.
+            sanitized_name = OutputProcessor.sanitize_filepath(file.filename)
 
             # Store file with the sanitized name
             file_id = await file_service.store_uploaded_file(
@@ -170,6 +188,7 @@ async def upload_file(
                 filename=sanitized_name,
                 content=content,
                 content_type=file.content_type,
+                read_only=read_only_flag,
             )
 
             uploaded_files.append(
@@ -311,18 +330,25 @@ async def upload_files_batch(
     succeeded = 0
     failed = 0
 
+    # ``read_only=true`` marks every file in the batch as infrastructure (a
+    # skill bundle). Persisted on file metadata so the executor can echo it
+    # back as an inherited input rather than surfacing it as a generated
+    # artifact (mirrors code-interpreter's X-Read-Only semantics).
+    read_only_flag = (read_only or "").strip().lower() == "true"
+
     for upload in upload_files:
         try:
             if upload.size and upload.size > settings.max_file_size_mb * 1024 * 1024:
                 raise ValueError(f"File {upload.filename} exceeds maximum size of {settings.max_file_size_mb}MB")
 
             content = await upload.read()
-            sanitized_name = OutputProcessor.sanitize_filename(upload.filename or "file")
+            sanitized_name = OutputProcessor.sanitize_filepath(upload.filename or "file")
             file_id = await file_service.store_uploaded_file(
                 session_id=session_id,
                 filename=sanitized_name,
                 content=content,
                 content_type=upload.content_type,
+                read_only=read_only_flag,
             )
             results.append(
                 {
@@ -572,6 +598,79 @@ async def download_file_options(session_id: str, file_id: str):
     )
 
 
+@router.get("/sessions/{session_id}/objects/{file_id}")
+async def get_session_object(
+    session_id: str,
+    file_id: str,
+    kind: str | None = Query(None, description="Resource kind: 'skill', 'agent', or 'user'"),
+    resource_id: str | None = Query(None, alias="id", description="Resource id (userId / agentId / skillId)"),
+    version: int | None = Query(None, description="Resource version (only meaningful for kind=skill)"),
+    file_service: FileServiceDep = None,
+    session_service: SessionServiceDep = None,
+):
+    """Return file object metadata for a session - LibreChat compatible.
+
+    Called by LibreChat's ``getSessionInfo`` (process.js) to check whether a
+    previously-uploaded file is still live in the code environment.  The
+    response must include ``lastModified`` — LibreChat uses it to decide
+    whether to re-upload.
+
+    Query params ``kind``/``id``/``version`` are accepted for parity with
+    LibreChat's ``buildCodeEnvDownloadQuery`` but are not enforced today.
+    """
+    try:
+        file_info = await file_service.get_file_info(session_id, file_id)
+        if not file_info:
+            raise HTTPException(status_code=404, detail="File not found")
+
+        # Determine lastModified: prefer session last_activity for active
+        # sessions (mirrors the /files/{session_id} detail=summary logic).
+        last_modified = None
+        try:
+            session = await session_service.get_session(session_id)
+            if session:
+                if session.status == SessionStatus.ACTIVE:
+                    last_modified = datetime.now(UTC)
+                elif session.last_activity:
+                    act = session.last_activity
+                    if isinstance(act, str):
+                        act = datetime.fromisoformat(act)
+                    if act.tzinfo is None:
+                        act = act.replace(tzinfo=UTC)
+                    last_modified = act
+        except Exception as exc:
+            logger.warning(
+                "Failed to retrieve session for lastModified derivation, falling back to file created_at",
+                session_id=session_id,
+                error=str(exc),
+            )
+
+        if last_modified is None:
+            last_modified = file_info.created_at
+            if isinstance(last_modified, str):
+                last_modified = datetime.fromisoformat(last_modified)
+            if last_modified.tzinfo is None:
+                last_modified = last_modified.replace(tzinfo=UTC)
+
+        last_modified_str = last_modified.isoformat(timespec="milliseconds").replace("+00:00", "Z")
+
+        return {
+            "name": f"{session_id}/{file_id}",
+            "lastModified": last_modified_str,
+        }
+
+    except HTTPException:
+        raise
+    except Exception as e:
+        logger.error(
+            "Failed to get session object info",
+            session_id=session_id,
+            file_id=file_id,
+            error=str(e),
+        )
+        raise HTTPException(status_code=500, detail="Internal server error")
+
+
 @router.delete("/files/{session_id}/{file_id}")
 async def delete_file(session_id: str, file_id: str, file_service: FileServiceDep = None):
     """Delete a file from the session - LibreChat compatible."""
@@ -599,3 +698,23 @@ async def delete_file(session_id: str, file_id: str, file_service: FileServiceDe
             error=str(e),
         )
         raise HTTPException(status_code=500, detail="Failed to delete file")
+
+
+@router.delete("/sessions/{session_id}/objects/{file_id}")
+async def delete_session_object(
+    session_id: str,
+    file_id: str,
+    kind: str | None = Query(None, description="Resource kind: 'skill', 'agent', or 'user'"),
+    resource_id: str | None = Query(None, alias="id", description="Resource id (userId / agentId / skillId)"),
+    version: int | None = Query(None, description="Resource version (only meaningful for kind=skill)"),
+    file_service: FileServiceDep = None,
+):
+    """Delete a session object - LibreChat compatible alias of ``delete_file``.
+
+    LibreChat's ``deleteFile`` (process.js) issues ``DELETE /sessions/{session}/
+    objects/{file}`` first and only falls back to ``DELETE /files/{session}/
+    {file}`` on failure. Serving this path directly avoids the extra 404
+    round-trip. Query params ``kind``/``id``/``version`` are accepted for
+    parity with ``buildCodeEnvDownloadQuery`` but are not enforced today.
+    """
+    return await delete_file(session_id, file_id, file_service)

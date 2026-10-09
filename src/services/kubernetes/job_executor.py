@@ -19,6 +19,7 @@ from .client import (
     get_batch_api,
     get_core_api,
     get_current_namespace,
+    handle_unauthorized,
 )
 from .models import (
     ExecutionResult,
@@ -155,6 +156,7 @@ class JobExecutor:
             )
 
         except ApiException as e:
+            handle_unauthorized(e.status)
             logger.error(
                 "Failed to create job",
                 job_name=job_name,
@@ -225,6 +227,7 @@ class JobExecutor:
                         return False
 
             except ApiException as e:
+                handle_unauthorized(e.status)
                 logger.warning(
                     "Error checking pod status",
                     job_name=job.name,
@@ -358,9 +361,13 @@ class JobExecutor:
         for file_data in files:
             try:
                 files_payload = {"files": (file_data.filename, file_data.content)}
+                # The nested relative path is sent out-of-band because RFC 7578
+                # strips directories from the multipart filename; the runner
+                # recreates the directory tree from this ``path`` value.
                 await client.post(
                     f"{runner_url}/files",
                     files=files_payload,
+                    data={"path": file_data.filename},
                     timeout=30,
                 )
             except Exception as e:
@@ -397,6 +404,7 @@ class JobExecutor:
             logger.debug("Deleted job", job_name=job.name)
 
         except ApiException as e:
+            handle_unauthorized(e.status)
             if e.status != 404:
                 logger.warning(
                     "Failed to delete job",

@@ -103,6 +103,8 @@ class FileService(FileServiceInterface):
                 metadata["size"] = int(metadata["size"])
             if "created_at" in metadata:
                 metadata["created_at"] = datetime.fromisoformat(metadata["created_at"])
+            if "read_only" in metadata:
+                metadata["read_only"] = str(metadata["read_only"]).lower() == "true"
 
             return metadata
 
@@ -239,6 +241,7 @@ class FileService(FileServiceInterface):
             content_type=metadata["content_type"],
             created_at=metadata["created_at"],
             path=metadata["path"],
+            read_only=metadata.get("read_only", False),
         )
 
     async def list_files(self, session_id: str) -> list[FileInfo]:
@@ -472,6 +475,7 @@ class FileService(FileServiceInterface):
         filename: str,
         content: bytes,
         content_type: str | None = None,
+        read_only: bool = False,
     ) -> str:
         """Store an uploaded file directly."""
         await self._ensure_bucket_exists()
@@ -510,6 +514,9 @@ class FileService(FileServiceInterface):
                 "size": len(content),
                 "path": f"/{filename}",
                 "type": "upload",  # Mark as uploaded file
+                # Redis hashes only accept bytes/str/int/float (redis-py raises
+                # DataError on bool, failing the whole hset) - store as string.
+                "read_only": "true" if read_only else "false",
             }
 
             await self._store_file_metadata(session_id, file_id, metadata)
