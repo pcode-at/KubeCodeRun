@@ -42,9 +42,16 @@ RUN uv sync --locked --no-install-project --no-dev
 COPY . /app
 RUN uv sync --locked --no-dev
 
-# Create runtime directories with correct ownership for the non-root user (UID 65532)
-RUN mkdir -p /app/logs /app/data /app/ssl && \
-    chown -R 65532:65532 /app/logs /app/data /app/ssl
+# Stage /usr/bin/env and the runtime directories (owned by the non-root user,
+# UID 65532) in one tree, so the final stage adds them in a single layer.
+# A separate COPY of /usr/bin/env is a no-op when builder and runtime share the
+# same base image; the classic builder then commits an empty layer and the
+# next COPY fails with "failed to get layer ...: layer does not exist" on
+# naive-diff storage drivers (e.g. ACR Tasks). The new /app directories keep
+# this layer non-empty.
+RUN mkdir -p /rootfs/usr/bin /rootfs/app/logs /rootfs/app/data /rootfs/app/ssl && \
+    cp -p /usr/bin/env /rootfs/usr/bin/env && \
+    chown -R 65532:65532 /rootfs/app/logs /rootfs/app/data /rootfs/app/ssl
 
 ################################
 # Final stage - minimal runtime image
@@ -64,13 +71,9 @@ LABEL maintainer="KubeCodeRun Contributors" \
     org.opencontainers.image.source="https://github.com/aron-muon/KubeCodeRun" \
     org.opencontainers.image.licenses="Apache-2.0"
 
-# Copy /usr/bin/env for execution patterns
-COPY --from=builder /usr/bin/env /usr/bin/
-
-# Copy runtime directories with correct ownership
-COPY --chown=65532:65532 --from=builder /app/logs /app/logs
-COPY --chown=65532:65532 --from=builder /app/data /app/data
-COPY --chown=65532:65532 --from=builder /app/ssl /app/ssl
+# Copy /usr/bin/env for execution patterns and the runtime directories
+# (ownership 65532 preserved from the builder stage)
+COPY --from=builder /rootfs/ /
 
 # Copy the virtual environment from builder
 # uv creates .venv with symlinks to the system Python (/usr/local/bin on the
